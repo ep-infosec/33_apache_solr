@@ -1,0 +1,228 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import org.apache.tools.ant.util.TeeOutputStream
+
+// This project puts together a "distribution", assembling dependencies from
+// various other projects.
+
+plugins {
+  id 'base'
+  id 'distribution'
+}
+
+description = 'Solr distribution packaging'
+
+ext {
+  distDir = file("$buildDir/solr-${version}")
+  devDir = file("$buildDir/dev")
+}
+
+configurations {
+  modules
+  example
+  prometheusExporter
+  server
+  docs
+  docker
+  solrTgz
+  solrTgzSignature
+}
+
+artifacts {
+  solrTgz(distTar)
+}
+
+dependencies {
+  project(":solr:modules").childProjects.values().stream().map(project -> project.path).each { module ->
+    modules project(path: module, configuration: "packaging")
+  }
+
+  prometheusExporter project(path: ":solr:prometheus-exporter", configuration: "packaging")
+
+  example project(path: ":solr:example", configuration: "packaging")
+  server project(path: ":solr:server", configuration: "packaging")
+
+  // Copy files from documentation output
+  docs project(path: ':solr:documentation', configuration: 'minimalSite')
+
+  docker project(path: ':solr:docker', configuration: 'packaging')
+
+  solrTgzSignature files("$buildDir/distributions/solr-${version}.tgz.asc") {
+    builtBy ":solr:distribution:signBinaryTgz"
+  }
+}
+
+distributions {
+  main {
+    distributionBaseName = 'solr'
+    contents {
+
+      from(rootDir, {
+        include "LICENSE.txt"
+        include "NOTICE.txt"
+      })
+
+      from(project(":solr").projectDir, {
+        include "bin/**"
+        include "licenses/**"
+        exclude "licenses/README.committers.txt"
+        include "CHANGES.txt"
+      })
+
+      from(projectDir, {
+        include "README.txt"
+      })
+
+      from ('static/lib', {
+        into 'lib'
+      })
+
+      from(configurations.modules, {
+        into "modules"
+      })
+
+      from(configurations.example, {
+        into "example"
+      })
+
+      from(configurations.prometheusExporter, {
+        into "prometheus-exporter"
+      })
+
+      from(configurations.server, {
+        into "server"
+      })
+
+      from(configurations.docs, {
+        into "docs"
+      })
+
+      from(configurations.docker, {
+        into "docker"
+        filesMatching([
+            "scripts/**",
+        ]) { copy ->
+          copy.setMode(0755)
+        }
+      })
+
+      // Manually correct posix permissions (matters when packaging on Windows).
+      filesMatching([
+          "**/*.sh",
+          "**/bin/post",
+          "**/bin/postlogs",
+          "**/bin/solr",
+          "**/bin/init.d/solr",
+          "**/bin/solr-exporter",
+      ]) { copy ->
+        copy.setMode(0755)
+      }
+
+    }
+  }
+}
+
+installDist {
+  into distDir
+}
+
+task dev(type: Copy) {
+  description "Assemble Solr distribution into 'development' folder at ${devDir}"
+  group "build"
+
+  from installDist.outputs
+  into devDir
+}
+
+distTar {
+  compression = Compression.GZIP
+}
+
+distZip.enabled = false
+
+assemble.dependsOn installDist
+
+task downloadBats(type: NpmTask) {
+  group = 'Build Dependency Download'
+  args = ["install", "bats@1.8.0",
+                     "ztombol/bats-support#v0.2.0",
+                     "ztombol/bats-assert#v0.3.0",
+                     "ztombol/bats-file#v0.2.0",
+  ]
+
+  inputs.files("${project.ext.nodeProjectDir}/package.json")
+  outputs.dir("${project.ext.nodeProjectDir}/node_modules/bats")
+  outputs.dir("${project.ext.nodeProjectDir}/node_modules/bats-support")
+  outputs.dir("${project.ext.nodeProjectDir}/node_modules/bats-assert")
+  outputs.dir("${project.ext.nodeProjectDir}/node_modules/bats-file")
+}
+
+task integrationTests(type: BatsTask) {
+  dependsOn installDist
+  dependsOn downloadBats
+
+  def integrationTestOutput = "$buildDir/test-output"
+  def solrHome = "$integrationTestOutput/solr-home"
+  def solrTestFailuresDir = "$integrationTestOutput/failure-snapshots"
+
+  inputs.dir(distDir)
+  outputs.dir(integrationTestOutput)
+
+  doFirst {
+    delete integrationTestOutput
+    mkdir integrationTestOutput
+    mkdir solrHome
+    mkdir solrTestFailuresDir
+
+    // TODO - if quiet then don't tee
+    standardOutput = new TeeOutputStream(System.out, new FileOutputStream("$integrationTestOutput/test-output.txt"))
+
+  }
+
+  environment SOLR_TIP: distDir.toString()
+  environment SOLR_HOME: solrHome
+  environment SOLR_LOGS_DIR: "$solrHome/logs"
+  environment TEST_FAILURE_DIR: solrTestFailuresDir
+  environment BATS_LIB_PREFIX: "$nodeProjectDir/node_modules"
+}
+
+class BatsTask extends Exec {
+  @InputDirectory
+  String testDir = 'test'
+
+  @Input
+  var testFiles = []
+
+  @Option(option = "tests", description = "Sets test cases to be included")
+  public void setTestNamePatterns(List<String> tests) {
+    // TODO: bats --filter <regex>
+    tests.each { testFiles << "$testDir/$it" }
+  }
+
+  @Override
+  @TaskAction
+  protected void exec() {
+    executable "$project.ext.nodeProjectDir/node_modules/bats/bin/bats"
+
+    // Note: tests to run must be listed after all other arguments
+    // Additional debugging output: -x, --verbose-run
+    setArgs(['--print-output-on-failure'] + (testFiles.empty ? testDir : testFiles))
+
+    super.exec()
+  }
+}
